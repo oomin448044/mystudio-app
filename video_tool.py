@@ -6,8 +6,58 @@ wherever a freeze frame is added).
 """
 import json
 import os
+import re
+import shutil
 import subprocess
 import tempfile
+
+
+def _ensure_ffmpeg():
+    """Make sure an `ffmpeg` binary is on PATH.
+
+    Prefers imageio-ffmpeg's static build (pip-installable, no apt needed —
+    keeps cloud containers light). Falls back to a system ffmpeg.
+    Returns the binary path.
+    """
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if os.path.isfile(exe):
+            bindir = os.path.join(tempfile.gettempdir(), 'mystudio_bin')
+            os.makedirs(bindir, exist_ok=True)
+            link = os.path.join(bindir, 'ffmpeg')
+            if not os.path.exists(link):
+                try:
+                    os.symlink(exe, link)
+                except OSError:
+                    shutil.copy(exe, link)
+            path = os.environ.get('PATH', '')
+            if bindir not in path.split(os.pathsep):
+                os.environ['PATH'] = bindir + os.pathsep + path
+            return link
+    except Exception:
+        pass
+    return shutil.which('ffmpeg') or 'ffmpeg'
+
+
+FFMPEG = _ensure_ffmpeg()
+FFPROBE = shutil.which('ffprobe')  # None when only the static build exists
+
+
+def _parse_ffmpeg_i(path):
+    """Fallback probe: parse `ffmpeg -i` stderr (no ffprobe available)."""
+    r = subprocess.run([FFMPEG, '-hide_banner', '-i', path],
+                       capture_output=True, text=True)
+    err = r.stderr or ''
+    info = {'duration': 0.0, 'has_audio': False}
+    m = re.search(r'Duration: (\d+):(\d+):([\d.]+)', err)
+    if m:
+        info['duration'] = (int(m.group(1)) * 3600 + int(m.group(2)) * 60
+                            + float(m.group(3)))
+    for line in err.splitlines():
+        if 'Audio:' in line:
+            info['has_audio'] = True
+    return info
 
 
 def _run(cmd):
@@ -43,15 +93,19 @@ def _run_progress(cmd, total_us, progress_cb):
 
 
 def probe_duration(path):
-    r = _run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-              '-of', 'json', path])
-    return float(json.loads(r.stdout)['format']['duration'])
+    if FFPROBE:
+        r = _run([FFPROBE, '-v', 'error', '-show_entries', 'format=duration',
+                  '-of', 'json', path])
+        return float(json.loads(r.stdout)['format']['duration'])
+    return _parse_ffmpeg_i(path)['duration']
 
 
 def probe_has_audio(path):
-    r = _run(['ffprobe', '-v', 'error', '-select_streams', 'a',
-              '-show_entries', 'stream=index', '-of', 'json', path])
-    return len(json.loads(r.stdout).get('streams', [])) > 0
+    if FFPROBE:
+        r = _run([FFPROBE, '-v', 'error', '-select_streams', 'a',
+                  '-show_entries', 'stream=index', '-of', 'json', path])
+        return len(json.loads(r.stdout).get('streams', [])) > 0
+    return _parse_ffmpeg_i(path)['has_audio']
 
 
 def transform(src, dst, freeze_every=5.0, freeze_dur=0.5,
